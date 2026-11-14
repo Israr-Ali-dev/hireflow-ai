@@ -1,0 +1,3 @@
+# The AI rejects Applications without human review until Shortlisting
+
+Screening and the Assessment pass or reject Applications automatically against the Recruiter's Pass Thresholds; the first human gate is Shortlisting, after every Stage is passed. We chose this over a human gate before each Candidate-facing step because the point of the pipeline is to spare Recruiters from reading every CV. The risk of silent wrong rejections is contained in three ways: every score must cite Evidence, Recruiters can see any AI rejection and Reinstate it, and an Application the AI fails to score goes to Needs Review instead of being rejected.
