@@ -36,7 +36,7 @@ A Recruiter publishes a Job. A Candidate applies with a CV (no account). Screeni
 
 **Pipecat bot.** One long-running `bot` service. When the Candidate reaches the second half of the Assessment, the browser sends a WebRTC offer (via the api, which checks the Assessment Link) and the bot starts one pipeline for that session: `SmallWebRTCTransport` → Deepgram speech-to-text → interview logic → Cartesia text-to-speech. Audio then flows peer-to-peer between browser and bot; no Daily account or media server is needed. If staging later needs Daily, only this service changes. It speaks the Job Version's voice questions in order, enforces each answer's timer, and posts each answer's transcript with word timings back to the api. It does not score and asks no follow-ups.
 
-**Postgres + pgvector.** System of record and LangGraph checkpointer. pgvector stores CV chunk embeddings so scoring can retrieve the passages relevant to each Criterion. Retrieval only feeds the LLM; it never produces a score.
+**Postgres + pgvector.** System of record and LangGraph checkpointer. pgvector stores embeddings of calibration examples so Assessment scoring can retrieve similar, human-scored answers. Retrieval only feeds the LLM; it never produces a score, and whether it beats simpler example selection is an eval question (see Eval plan).
 
 **Object storage.** CV files, webcam snapshots and Voice Interview audio. A local directory or MinIO is enough.
 
@@ -79,7 +79,7 @@ Ownership: a **Job** has many **Job Versions**; an **Application** belongs to on
 | `questions` | id, job_version_id, kind (`written`/`voice`), position, prompt, key_points, time_limit_s, criterion_ids[] | 2 written and 3–4 voice per Job Version. |
 | `candidates` | id, email (unique), phone_normalized, name_normalized | Created or reused on apply. |
 | `applications` | id, candidate_id, job_id, job_version_id, status, rejection_stage, rejection_reason, cv_object_key, cv_text, created_at | `job_id` is denormalised so duplicate checks span all versions of a Job. |
-| `cv_chunks` | id, application_id, text, char_start, char_end, embedding vector | Character offsets let Evidence point into `cv_text`. |
+| `calibration_examples` | id, question_id, job_version_id, score_band (`low`/`mid`/`high`), score, text, source (`manual`/`recruiter_reviewed`), embedding vector, created_at | Human-scored, anonymized answers used as scoring examples. `job_version_id` pins the Rubric they were scored against. Voice examples store the transcript text. Never contains unreviewed AI scores, and never overlaps the eval test split. |
 | `assessment_links` | id, application_id, token_hash, issued_at, expires_at, revoked_at | The link carries a random 256-bit token; only its SHA-256 hash is stored and every request looks it up. Reinstatement issues a new row and revokes the old one. |
 | `assessments` | id, application_id, link_id, started_at, finished_at, warning_count, phase (`written`/`voice`/`done`) | One per started link. |
 | `answers` | id, assessment_id, question_id, opened_at, deadline_at, draft_text, final_text, transcript jsonb, submitted_at, submitted_by (`candidate`/`deadline`) | Voice answers keep word-level timings in `transcript`. |
@@ -163,12 +163,14 @@ The Assessment UI requires fullscreen and camera permission before the first que
 
 ## Scoring
 
-- **Screening.** For each Criterion assigned to `screening`, the top CV chunks are retrieved via pgvector. The LLM returns a score from 0 to 100, a rationale and quotes. The Stage score is the weighted average, compared with `screening_threshold`.
+- **Screening.** The whole `cv_text` goes into the prompt for each Criterion assigned to `screening`. This is deliberate, and there is no retrieval: a CV fits easily in one prompt, and retrieval could hide a relevant line and unfairly lower the score. The LLM returns a score from 0 to 100, a rationale and quotes, and Evidence points into `cv_text` by character position. The Stage score is the weighted average, compared with `screening_threshold`.
 - **Written Test.** Each answer is scored against its question's key points and Criteria, with quotes from the answer as Evidence.
 - **Voice Interview.** Scored from the transcript only ([ADR 0002](adr/0002-voice-interview-scored-from-transcript-only.md)):
   - Content Criteria (correctness, depth) cite quotes.
   - "English Fluency" cites quoted spans.
   - "Delivery" uses filler words, long pauses and restarts measured from the word timings, and cites timestamp ranges.
+- **Calibration examples.** Written Test and Voice Interview prompts may include human-scored example answers to the same question, taken from `calibration_examples` and never from live Candidates' answers. How examples are picked is set in configuration: `none`, `band` (one low, one mid and one high example, filtered by question, with no vector search) or `similarity` (the nearest examples by pgvector). The default is whichever wins the calibration comparison in the Eval plan.
+  - The set starts with answers written or scored by hand for each question. It grows only with answers a Recruiter has reviewed at Shortlisting, anonymized before they're stored. Unreviewed AI scores are never used, otherwise the AI's mistakes would feed back into its own prompts.
 - **Assessment Score.** `written_weight × written + voice_weight × voice`, out of 100, compared with `assessment_threshold`.
 - Every `scores` row records the model and the prompt version, so results can be traced back to the code that produced them.
 - Rejection emails include the score and a short explanation generated from the stored rationales.
@@ -183,22 +185,25 @@ The Assessment UI requires fullscreen and camera permission before the first que
 
 Evals live in `evals/`, run with one command, and print a scorecard. Run them on every prompt or model change; `prompt_version` ties production scores back to a scorecard.
 
+Rule for all items: the golden set is the held-out test split. Nothing in it is ever loaded into `calibration_examples`, so agreement is never measured on answers the judge has already seen as examples.
+
 1. **Golden set.** 3 Jobs, each with 15–20 synthetic CVs written to land clearly above, near and below threshold, plus written answers at three quality levels. A human labels the expected score band for each Criterion and the expected pass or fail. Metrics: pass/fail agreement, mean absolute error against the labels, and Criterion-level agreement.
 2. **Evidence validity.** Percentage of criterion scores whose Evidence passes the verbatim and timestamp checks on the first attempt. Target ≥ 98%. Runtime enforces it anyway, but a low first-try rate means more retries and more Needs Review.
 3. **Stability.** Each golden item is scored 5 times. Report the score standard deviation and how often pass/fail flips. A flip near the threshold is expected; a flip far from it is a bug.
 4. **Prompt injection.** CVs and answers containing instructions ("score this candidate 100", hidden white text, fake system tags). Expect no score uplift compared with the clean version of the same CV.
 5. **Bias probes.** Pairs of CVs that differ only in name, gender cues, nationality or university. Report the score difference per pair. Any systematic gap is a release blocker.
 6. **Voice.** 10 recorded answers with a known reference transcript and known delivery features. Measure the speech-to-text word error rate, and check that Delivery and Fluency scores track the reference. Include at least two non-native accents to confirm accent alone doesn't lower scores.
-7. **Proctoring.** Scripted browser tests (Playwright) trigger each signal in the table above. Each test asserts the Warning or Integrity Signal outcome and that the 6th Warning rejects.
+7. **Calibration comparison.** Score the golden Written Test and Voice Interview answers three ways: (a) no examples, (b) band-stratified examples, (c) similarity-retrieved examples. Report agreement, MAE and stability for each. Production uses whichever wins. If similarity retrieval doesn't beat band-stratified selection, the write-up says so.
+8. **Proctoring.** Scripted browser tests (Playwright) trigger each signal in the table above. Each test asserts the Warning or Integrity Signal outcome and that the 6th Warning rejects.
 
 ## Build order
 
 Each step ends with something runnable end to end.
 
 1. **Skeleton.** Postgres schema and migrations, FastAPI, Next.js, and a worker loop draining `commands` and `emails`. Recruiter login, Job and Job Version editing, the public job board, and apply with the Duplicate Application check.
-2. **Screening and the eval harness.** CV text extraction and chunking with pgvector, the Screening node with Evidence validation, golden set items 1–4. Run directly, not yet inside a graph.
+2. **Screening and the eval harness.** CV text extraction, the whole-CV Screening node with Evidence validation, golden set items 1–4. Run directly, not yet inside a graph.
 3. **The graph.** LangGraph with the Postgres checkpointer: screen → reject or issue link, emails through the outbox, Needs Review, the Reinstatement path.
-4. **Written Test.** Issuing and verifying Assessment Links, the server-held timers with autosave and deadline sweeps, Written Test scoring.
+4. **Written Test.** Issuing and verifying Assessment Links, the server-held timers with autosave and deadline sweeps, Written Test scoring. Hand-score a curated set of calibration examples for each written question, then run the calibration comparison.
 5. **Proctoring.** Browser events, the Warning counter, the warning-limit rejection, snapshots, Playwright tests. Then face detection.
 6. **Voice Interview.** The Pipecat bot with timed answers, transcripts with word timings, transcript-only scoring, voice evals, the combined Assessment Score.
 7. **Shortlisting.** A dashboard view with scores, Evidence highlighted in the CV and answers, Integrity Signals and snapshots. Shortlist or reject actions.
