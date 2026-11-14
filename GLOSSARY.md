@@ -5,7 +5,7 @@ An agentic hiring pipeline for a single organisation: job seekers apply to Jobs,
 ## People
 
 **Candidate**:
-A person who applies to Jobs, identified by their email address, phone number and name. Candidates have no account; one Candidate may apply to many Jobs.
+A person who applies to Jobs, identified by their email address; phone number and name are used only to detect Duplicate Applications. Candidates have no account; one Candidate may apply to many Jobs.
 _Avoid_: Applicant, customer, user, job seeker (in code)
 
 **Recruiter**:

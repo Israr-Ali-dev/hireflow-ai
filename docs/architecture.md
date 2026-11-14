@@ -11,13 +11,13 @@ A Recruiter publishes a Job. A Candidate applies with a CV (no account). Screeni
 ## Services
 
 ```
-            ┌──────────────────────────── Next.js (web) ─────────────────────────────┐
+            ┌──────────────────── Next.js (web) — proxies /api/* ────────────────────┐
             │ Job board + apply form │ Assessment UI (proctored) │ Recruiter dashboard │
             └───────────┬────────────┴─────────────┬─────────────┴──────────┬─────────┘
                         │ HTTPS                    │ HTTPS + WebRTC          │ HTTPS
                         ▼                          ▼                         ▼
                  ┌─────────────┐  spawn/session ┌──────────────┐
-                 │ FastAPI api │───────────────▶│ Pipecat bot  │
+                 │ FastAPI api │──── offer ────▶│ Pipecat bot  │
                  └──────┬──────┘◀── answers ────└──────────────┘
                         │ commands (outbox table)
                         ▼
@@ -32,15 +32,39 @@ A Recruiter publishes a Job. A Candidate applies with a CV (no account). Screeni
 
 **api (FastAPI).** The only service the browser and the bot talk to. Owns validation, authentication (Recruiters) and link verification (Candidates), the Duplicate Application check, timer enforcement, and recording Integrity Signals and Warnings. It never runs LLM calls inline; anything that advances an Application is written as a command for the worker.
 
-**worker.** Runs the LangGraph graph for each Application and the scheduled sweeps (link expiry, question deadlines, unused Booking Links, Calendar polling). All LLM scoring happens here. Commands are read from a Postgres table with `FOR UPDATE SKIP LOCKED`, so there is no separate queue to run.
+**worker.** Runs the LangGraph graph for each Application and the scheduled sweeps (link expiry, question deadlines, unused Booking Links, Calendar polling). All LLM scoring happens here. Commands are read from a Postgres table with `FOR UPDATE SKIP LOCKED`, so there is no separate queue to run. A command is written in the same transaction as the state change that causes it. Moving to Redis + Celery is a later option if volume demands it; the `commands` table is the seam where that swap would happen.
 
-**Pipecat bot.** One process per Voice Interview session, started by the api when the Candidate reaches the second half of the Assessment. It speaks the Job Version's voice questions in order, enforces each answer's timer, and posts each answer's transcript with word timings back to the api. It does not score and asks no follow-ups.
+**Pipecat bot.** One long-running `bot` service. When the Candidate reaches the second half of the Assessment, the browser sends a WebRTC offer (via the api, which checks the Assessment Link) and the bot starts one pipeline for that session: `SmallWebRTCTransport` → Deepgram speech-to-text → interview logic → Cartesia text-to-speech. Audio then flows peer-to-peer between browser and bot; no Daily account or media server is needed. If staging later needs Daily, only this service changes. It speaks the Job Version's voice questions in order, enforces each answer's timer, and posts each answer's transcript with word timings back to the api. It does not score and asks no follow-ups.
 
 **Postgres + pgvector.** System of record and LangGraph checkpointer. pgvector stores CV chunk embeddings so scoring can retrieve the passages relevant to each Criterion. Retrieval only feeds the LLM; it never produces a score.
 
 **Object storage.** CV files, webcam snapshots and Voice Interview audio. A local directory or MinIO is enough.
 
 **Email.** Every outbound email is a row in an `emails` outbox table, sent by the worker. Emails are therefore idempotent and can be inspected.
+
+## Deployment
+
+v1 runs locally with `docker compose up`: `web`, `api`, `worker`, `bot`, `postgres` (with pgvector), `minio` and `mailpit`, which catches every outbound email so nothing reaches a real inbox. A staging deployment comes later. Nothing in v1 should assume it, but nothing should block it either: every service is configured through environment variables, and no service reaches another by `localhost`.
+
+## Code layout and tooling
+
+```
+hireflow/            one Python package: models, domain logic, graph, scoring, bot pipeline
+  api/               FastAPI app            → `python -m hireflow.api`
+  worker/            command loop + sweeps  → `python -m hireflow.worker`
+  bot/               Pipecat service        → `python -m hireflow.bot`
+migrations/          Alembic
+evals/
+web/                 Next.js
+docker-compose.yml
+```
+
+- The api, worker and bot run from one Docker image with different start commands.
+- **Database:** SQLAlchemy 2 (async) models with Alembic migrations, plus the `pgvector` SQLAlchemy type. The LangGraph Postgres checkpointer manages its own tables in the same database.
+- **One origin:** Next.js forwards `/api/*` to FastAPI using rewrites, so the browser only ever talks to `web`. Session cookies are first-party and no CORS setup is needed. Only the WebRTC audio itself goes directly between browser and bot.
+- **Recruiter auth:** there is no sign-up. `python -m hireflow.cli create-recruiter` creates accounts, and FastAPI issues an httpOnly session cookie on login.
+- **LLM:** scoring goes through one thin client interface. The provider, API key and model for each task come from environment variables (`LLM_PROVIDER`, `OPENAI_API_KEY`, `LLM_MODEL_SCORING`, …). v1 uses OpenAI with structured outputs, so every score arrives as validated JSON. Switching provider means writing one adapter and running the evals again.
+- **Speech:** Deepgram for speech-to-text (streaming, with word timings, which Delivery scoring needs) and Cartesia for text-to-speech, keyed by `DEEPGRAM_API_KEY` and `CARTESIA_API_KEY`.
 
 ## Data model
 
@@ -51,16 +75,16 @@ Ownership: a **Job** has many **Job Versions**; an **Application** belongs to on
 | `recruiters` | id, email, password_hash | The only accounts. |
 | `jobs` | id, title, status (`open`/`closed`), current_version_id | Closing stops new Applications only. |
 | `job_versions` | id, job_id, description, screening_threshold, assessment_threshold, written_weight, voice_weight, created_at | Immutable once an Application references it. Editing a Job inserts a new row. |
-| `criteria` | id, job_version_id, name, weight, stages (`screening`/`written`/`voice`[]) | A Stage's score is the weighted average of the Criteria assigned to it. |
+| `criteria` | id, job_version_id, name, weight, parts (`screening`/`written_test`/`voice_interview`[]) | A part's score is the weighted average of the Criteria assigned to it. |
 | `questions` | id, job_version_id, kind (`written`/`voice`), position, prompt, key_points, time_limit_s, criterion_ids[] | 2 written and 3–4 voice per Job Version. |
 | `candidates` | id, email (unique), phone_normalized, name_normalized | Created or reused on apply. |
 | `applications` | id, candidate_id, job_id, job_version_id, status, rejection_stage, rejection_reason, cv_object_key, cv_text, created_at | `job_id` is denormalised so duplicate checks span all versions of a Job. |
 | `cv_chunks` | id, application_id, text, char_start, char_end, embedding vector | Character offsets let Evidence point into `cv_text`. |
-| `assessment_links` | id, application_id, token_hash, issued_at, expires_at, revoked_at | Reinstatement issues a new row and revokes the old one. |
+| `assessment_links` | id, application_id, token_hash, issued_at, expires_at, revoked_at | The link carries a random 256-bit token; only its SHA-256 hash is stored and every request looks it up. Reinstatement issues a new row and revokes the old one. |
 | `assessments` | id, application_id, link_id, started_at, finished_at, warning_count, phase (`written`/`voice`/`done`) | One per started link. |
 | `answers` | id, assessment_id, question_id, opened_at, deadline_at, draft_text, final_text, transcript jsonb, submitted_at, submitted_by (`candidate`/`deadline`) | Voice answers keep word-level timings in `transcript`. |
-| `stage_scores` | id, application_id, stage (`screening`/`written`/`voice`/`assessment`), score, passed, model, prompt_version | `assessment` is the weighted combination. |
-| `criterion_scores` | id, stage_score_id, criterion_id, score (0–100), rationale | |
+| `scores` | id, application_id, part (`screening`/`written_test`/`voice_interview`/`assessment`), score, passed, model, prompt_version | `passed` is set only for the two Stages (`screening`, `assessment`); `assessment` is the weighted combination of the two halves. |
+| `criterion_scores` | id, score_id, criterion_id, score (0–100), rationale | |
 | `evidence` | id, criterion_score_id, source (`cv`/`answer`), source_id, quote, char_start, char_end, ts_start_ms, ts_end_ms | Every criterion score has at least one row. |
 | `integrity_signals` | id, assessment_id, kind, occurred_at, duration_ms, counted_as_warning, snapshot_object_key | |
 | `decisions` | id, application_id, kind (`reinstatement`/`shortlist`/`shortlist_reject`/`hired`/`final_reject`), recruiter_id, note, created_at | Every human action, recorded once. |
@@ -135,6 +159,7 @@ The Assessment UI requires fullscreen and camera permission before the first que
 - Each Warning is recorded with a webcam snapshot taken at that moment. A low-frequency periodic snapshot (around every 60 s) is also kept for the Recruiter at Shortlisting.
 - The single Warning counter covers the whole Assessment, both halves. The Candidate sees "Warning n of 5". The 6th Warning ends the Assessment, and the api writes a `warning_limit` command. The graph then rejects with `assessment/warning_limit` and emails the reason.
 - Face detection runs in the browser, so no video is streamed for proctoring. Its accuracy is a known weak point; that's why Recruiters can see snapshots and reinstate.
+- **Known v1 weakness:** every browser signal, face detection included, is reported by the Candidate's own machine, so a technical Candidate can suppress them. v1 accepts this. The planned hardening is for the worker to re-run face detection on the stored snapshots and record any disagreement as an Integrity Signal.
 
 ## Scoring
 
@@ -145,7 +170,7 @@ The Assessment UI requires fullscreen and camera permission before the first que
   - "English Fluency" cites quoted spans.
   - "Delivery" uses filler words, long pauses and restarts measured from the word timings, and cites timestamp ranges.
 - **Assessment Score.** `written_weight × written + voice_weight × voice`, out of 100, compared with `assessment_threshold`.
-- Every `stage_scores` row records the model and the prompt version, so results can be traced back to the code that produced them.
+- Every `scores` row records the model and the prompt version, so results can be traced back to the code that produced them.
 - Rejection emails include the score and a short explanation generated from the stored rationales.
 
 ## Booking and Final Decision
@@ -173,7 +198,7 @@ Each step ends with something runnable end to end.
 1. **Skeleton.** Postgres schema and migrations, FastAPI, Next.js, and a worker loop draining `commands` and `emails`. Recruiter login, Job and Job Version editing, the public job board, and apply with the Duplicate Application check.
 2. **Screening and the eval harness.** CV text extraction and chunking with pgvector, the Screening node with Evidence validation, golden set items 1–4. Run directly, not yet inside a graph.
 3. **The graph.** LangGraph with the Postgres checkpointer: screen → reject or issue link, emails through the outbox, Needs Review, the Reinstatement path.
-4. **Written Test.** Signing and verifying Assessment Links, the server-held timers with autosave and deadline sweeps, Written Test scoring.
+4. **Written Test.** Issuing and verifying Assessment Links, the server-held timers with autosave and deadline sweeps, Written Test scoring.
 5. **Proctoring.** Browser events, the Warning counter, the warning-limit rejection, snapshots, Playwright tests. Then face detection.
 6. **Voice Interview.** The Pipecat bot with timed answers, transcripts with word timings, transcript-only scoring, voice evals, the combined Assessment Score.
 7. **Shortlisting.** A dashboard view with scores, Evidence highlighted in the CV and answers, Integrity Signals and snapshots. Shortlist or reject actions.
@@ -183,8 +208,8 @@ Each step ends with something runnable end to end.
 ## Open choices
 
 These aren't decided yet and don't affect the domain model:
-- LLM provider and models.
-- Speech-to-text and text-to-speech providers for Pipecat, and its WebRTC transport.
-- Email provider.
+- Which OpenAI model to use for each task, to be chosen in build step 2 by comparing eval scorecards.
+- An email provider for staging. Locally, Mailpit catches everything.
+- A staging host, and whether it needs Daily or a TURN server for WebRTC.
 - How long webcam snapshots and audio are kept, and the wording of Candidate consent.
 - Accepted CV formats (PDF only is the simple default).
